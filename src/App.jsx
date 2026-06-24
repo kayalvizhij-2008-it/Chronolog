@@ -1,238 +1,441 @@
-import { useState } from "react";
-import { fetchAllRepoData } from "./services/github";
+import { useState, useCallback } from 'react';
+import './App.css';
+
+import { fetchAllRepoData } from './services/github';
 import {
-  generateFullAnalysis, generateStakeholderNotes, generateStory,
-  generateArchaeology, generateGraveyard, generateErrorPrediction,
-  generateImpactAnalysis, generateMindmap
-} from "./services/claude";
-import { buildTimeline } from "./services/utils";
-import { useVoice } from "./hooks/useVoice";
+  generateFullAnalysis,
+  generateStakeholderNotes,
+  generateStory,
+  generateArchaeology,
+  generateGraveyard,
+  generateErrorPrediction,
+  generateImpactAnalysis,
+  generateMindmap,
+} from './services/claude';
+import { buildTimeline } from './services/utils';
+import { useVoice } from './hooks/useVoice';
+import { useDemo } from './hooks/useDemo';
 
-import Dashboard from "./components/Dashboard";
-import Categories from "./components/Categories";
-import Stakeholders from "./components/Stakeholders";
-import Story from "./components/Story";
-import History from "./components/History";
-import Graveyard from "./components/Graveyard";
-import Timeline from "./components/Timeline";
-import Mindmap from "./components/Mindmap";
-import Impact from "./components/Impact";
-import RiskForecast from "./components/RiskForecast";
-import Share from "./components/Share";
-import AccessibilityToolbar from "./components/AccessibilityToolbar";
+import ErrorBoundary from './components/ErrorBoundary';
+import Dashboard from './components/Dashboard';
+import Categories from './components/Categories';
+import Stakeholders from './components/Stakeholders';
+import Story from './components/Story';
+import History from './components/History';
+import Graveyard from './components/Graveyard';
+import Timeline from './components/Timeline';
+import Mindmap from './components/Mindmap';
+import Impact from './components/Impact';
+import RiskForecast from './components/RiskForecast';
+import Share from './components/Share';
+import AccessibilityToolbar from './components/AccessibilityToolbar';
 
+// ── Tab Definitions ───────────────────────────────────────────
 const TABS = [
-  { id: 'dashboard', label: '📊 Dashboard' },
-  { id: 'categories', label: '📂 Categories' },
-  { id: 'stakeholders', label: '👥 Stakeholders' },
-  { id: 'story', label: '📖 Story' },
-  { id: 'history', label: '🏛️ History' },
-  { id: 'graveyard', label: '🚫 Graveyard' },
-  { id: 'timeline', label: '📅 Timeline' },
-  { id: 'mindmap', label: '🧠 Mindmap' },
-  { id: 'impact', label: '🌍 Impact' },
-  { id: 'risks', label: '⚠️ Risk Forecast' },
-  { id: 'share', label: '🚀 Share' }
+  { id: 'dashboard',    label: '📊 Dashboard' },
+  { id: 'categories',  label: '📂 Categories' },
+  { id: 'timeline',    label: '📅 Timeline' },
+  { id: 'mindmap',     label: '🧠 Mindmap' },
+  { id: 'impact',      label: '🌍 Impact' },
+  { id: 'risks',       label: '⚠️ Risk Forecast' },
+  { id: 'stakeholders',label: '👥 Stakeholders' },
+  { id: 'story',       label: '📖 Story' },
+  { id: 'history',     label: '🏛️ History' },
+  { id: 'graveyard',   label: '🚫 Graveyard' },
+  { id: 'share',       label: '🚀 Share' },
 ];
 
+// Tab → readable content for voice narration
+const TAB_NARRATION = (data) => ({
+  dashboard:    data?.analysis?.summary,
+  story:        data?.story,
+  history:      data?.archaeology,
+  impact:       data?.impact?.businessImpact?.reasoning,
+  risks:        data?.risks?.predictions?.map((p) => `${p.area}: ${p.risk}`).join('. '),
+  stakeholders: data?.stakeholders?.manager,
+});
+
+// ── Analysis Steps ────────────────────────────────────────────
+const STEPS = [
+  { label: '🔍 Fetching GitHub data…',        pct: 8  },
+  { label: '🤖 Running AI analysis…',          pct: 22 },
+  { label: '👥 Building stakeholder notes…',  pct: 35 },
+  { label: '📖 Writing the release story…',   pct: 48 },
+  { label: '🏛️ Digging through history…',     pct: 58 },
+  { label: '🚫 Finding the graveyard…',       pct: 68 },
+  { label: '🧠 Mapping the mind…',            pct: 78 },
+  { label: '🌍 Measuring impact…',            pct: 87 },
+  { label: '⚠️ Forecasting risk…',            pct: 95 },
+  { label: '✅ Finalizing report…',            pct: 100 },
+];
+
+// ── Demo Mode Sample URLs ──────────────────────────────────────
+const DEMO_URLS = [
+  'https://github.com/facebook/react',
+  'https://github.com/vercel/next.js',
+  'https://github.com/vitejs/vite',
+  'https://github.com/microsoft/vscode',
+];
+
+// ── App Component ─────────────────────────────────────────────
 export default function App() {
-  const [url, setUrl] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [step, setStep] = useState('');
+  const [url, setUrl]           = useState('');
+  const [loading, setLoading]   = useState(false);
+  const [step, setStep]         = useState('');
   const [progress, setProgress] = useState(0);
-  const [data, setData] = useState(null);
+  const [data, setData]         = useState(null);
+  const [error, setError]       = useState('');
   const [activeTab, setActiveTab] = useState('dashboard');
 
+  // Accessibility state
   const [fontScale, setFontScale] = useState(1);
   const [highContrast, setHighContrast] = useState(false);
-  const { speak, stop, speaking } = useVoice();
 
-  const analyze = async () => {
-    if (!url) return;
+  const { speak, stop, speaking, startListening, listening } = useVoice();
+
+  const {
+    isRunning: isDemoRunning,
+    startDemo,
+    stopDemo,
+    currentStepData,
+    showTooltip,
+    currentStep: demoStep,
+    totalSteps,
+  } = useDemo({ setActiveTab, speak, stop });
+
+  // ── Analyze ──────────────────────────────────────────────────
+  const analyze = useCallback(async () => {
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl || loading) return;
+
     setLoading(true);
     setData(null);
+    setError('');
     setProgress(0);
 
+    const tick = (i) => {
+      setStep(STEPS[i].label);
+      setProgress(STEPS[i].pct);
+    };
+
     try {
-      setStep('🔍 Fetching GitHub data...'); setProgress(10);
-      const repoData = await fetchAllRepoData(url);
+      tick(0);
+      const repoData = await fetchAllRepoData(trimmedUrl);
 
-      setStep('🤖 Running AI analysis...'); setProgress(25);
-      const analysis = await generateFullAnalysis(repoData.commits, repoData.prs, repoData.repoInfo);
+      tick(1);
+      const analysis = await generateFullAnalysis(
+        repoData.commits, repoData.prs, repoData.repoInfo
+      );
 
-      setStep('👥 Building stakeholder reports...'); setProgress(40);
-      const stakeholders = await generateStakeholderNotes(repoData.commits, analysis?.categories);
+      tick(2);
+      const stakeholders = await generateStakeholderNotes(
+        repoData.commits, analysis?.categories
+      );
 
-      setStep('📖 Writing the story...'); setProgress(50);
-      const story = await generateStory(repoData.commits, repoData.repoInfo.name);
+      tick(3);
+      const story = await generateStory(
+        repoData.commits, repoData.repoInfo.name
+      );
 
-      setStep('🏛️ Digging through history...'); setProgress(60);
-      const archaeology = await generateArchaeology(repoData.commits, repoData.repoInfo);
+      tick(4);
+      const archaeology = await generateArchaeology(
+        repoData.commits, repoData.repoInfo
+      );
 
-      setStep('🚫 Finding the graveyard...'); setProgress(70);
-      const graveyard = await generateGraveyard(repoData.prs, repoData.branches);
+      tick(5);
+      const graveyard = await generateGraveyard(
+        repoData.prs, repoData.branches
+      );
 
-      setStep('🧠 Mapping the mind...'); setProgress(80);
-      const mindmap = await generateMindmap(repoData.commits, analysis?.categories);
+      tick(6);
+      const mindmap = await generateMindmap(
+        repoData.commits, analysis?.categories
+      );
 
-      setStep('🌍 Measuring impact...'); setProgress(88);
-      const impact = await generateImpactAnalysis(repoData.commits, repoData.repoInfo);
+      tick(7);
+      const impact = await generateImpactAnalysis(
+        repoData.commits, repoData.repoInfo
+      );
 
-      setStep('⚠️ Forecasting risk...'); setProgress(95);
-      const risks = await generateErrorPrediction(repoData.commits, repoData.repoInfo);
+      tick(8);
+      const risks = await generateErrorPrediction(
+        repoData.commits, repoData.repoInfo
+      );
 
+      tick(9);
       const timeline = buildTimeline(repoData.commits);
 
-      setProgress(100);
       setData({
         analysis, stakeholders, story, archaeology, graveyard,
         mindmap, impact, risks, timeline,
-        repoInfo: repoData.repoInfo, commits: repoData.commits
+        repoInfo: repoData.repoInfo,
+        commits:  repoData.commits,
+        languages: repoData.languages,
       });
       setActiveTab('dashboard');
     } catch (err) {
-      console.error(err);
-      alert('Something went wrong. Check console for details.');
+      console.error('[ChronoLog] analyze error:', err);
+      setError(err.message || 'Something went wrong. Check the console for details.');
+    } finally {
+      setLoading(false);
+      setStep('');
+      setProgress(0);
     }
-    setLoading(false);
-    setStep('');
-  };
+  }, [url, loading]);
 
-  const downloadReport = () => {
-    const content = `# ${data.repoInfo.name} — ChronoLog Report
-
-## Version: ${data.analysis?.version?.recommended}
-## Summary
-${data.analysis?.summary}
-
-## Risk Forecast: ${data.risks?.overallRiskLevel}
-${data.risks?.predictions?.map(p => `- ${p.area}: ${p.risk} (${p.severity})`).join('\n')}
-
-## Business & SDG Impact
-${data.impact?.businessImpact?.reasoning}
-
-## For Developers
-${data.stakeholders?.developer}
-
-## Project Story
-${data.story}
-
-## Project History
-${data.archaeology}
-`;
-    const blob = new Blob([content], { type: 'text/markdown' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `${data.repoInfo.name}-chronolog.md`;
-    a.click();
-  };
-
-  const readAloud = () => {
-    const map = {
-      dashboard: data?.analysis?.summary,
-      story: data?.story,
-      history: data?.archaeology,
-      impact: data?.impact?.businessImpact?.reasoning,
-      risks: data?.risks?.predictions?.map(p => `${p.area}: ${p.risk}`).join('. ')
-    };
+  // ── Voice narration for current tab ──────────────────────────
+  const readAloud = useCallback(() => {
+    if (!data) return;
+    const map = TAB_NARRATION(data);
     speak(map[activeTab] || 'No readable content on this tab.');
-  };
+  }, [data, activeTab, speak]);
 
+  // ── Tab renderer ──────────────────────────────────────────────
   const renderTab = () => {
     if (!data) return null;
-    switch (activeTab) {
-      case 'dashboard': return <Dashboard data={data} />;
-      case 'categories': return <Categories data={data} />;
-      case 'stakeholders': return <Stakeholders data={data} />;
-      case 'story': return <Story data={data} />;
-      case 'history': return <History data={data} />;
-      case 'graveyard': return <Graveyard data={data} />;
-      case 'timeline': return <Timeline data={data} />;
-      case 'mindmap': return <Mindmap data={data} />;
-      case 'impact': return <Impact data={data} />;
-      case 'risks': return <RiskForecast data={data} />;
-      case 'share': return <Share data={data} />;
-      default: return null;
-    }
+    const props = { data };
+    const map = {
+      dashboard:    <Dashboard    {...props} />,
+      categories:   <Categories   {...props} />,
+      timeline:     <Timeline     {...props} />,
+      mindmap:      <Mindmap      {...props} />,
+      impact:       <Impact       {...props} />,
+      risks:        <RiskForecast {...props} />,
+      stakeholders: <Stakeholders {...props} />,
+      story:        <Story        {...props} />,
+      history:      <History      {...props} />,
+      graveyard:    <Graveyard    {...props} />,
+      share:        <Share        {...props} />,
+    };
+    return map[activeTab] ?? null;
   };
 
+  // ── Render ────────────────────────────────────────────────────
   return (
-    <div style={{
-      fontFamily: "'Segoe UI', sans-serif", minHeight: '100vh',
-      background: '#0f0f1a', color: '#e2e8f0', fontSize: `${fontScale}em`,
-      filter: highContrast ? 'contrast(1.4) brightness(1.1)' : 'none'
-    }}>
-      <div style={{ background: 'linear-gradient(135deg, #1e1b4b, #312e81)', padding: '32px 24px', textAlign: 'center' }}>
-        <h1 style={{ margin: 0, fontSize: 42, background: 'linear-gradient(to right, #818cf8, #c084fc)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
-          ⚡ ChronoLog
-        </h1>
-        <p style={{ color: '#a5b4fc', margin: '8px 0 24px', fontSize: 16 }}>Every repo has a story. We tell it.</p>
+    <div
+      style={{
+        minHeight: '100vh',
+        background: 'var(--bg-base)',
+        color: 'var(--text-primary)',
+        fontSize: `${fontScale}em`,
+      }}
+    >
+      {/* ── Hero Header ── */}
+      <header className="hero">
+        <div style={{ position: 'relative', zIndex: 1 }}>
+          <h1 className="hero-title">⚡ ChronoLog</h1>
+          <p className="hero-sub">Every repo has a story. We tell it.</p>
 
-        <div style={{ display: 'flex', gap: 12, maxWidth: 700, margin: '0 auto' }}>
-          <input
-            value={url} onChange={e => setUrl(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && analyze()}
-            placeholder="https://github.com/owner/repo"
-            style={{ flex: 1, padding: '14px 16px', fontSize: 15, borderRadius: 10, border: '2px solid #4338ca', background: '#1e1b4b', color: 'white', outline: 'none' }}
-          />
-          <button onClick={analyze} disabled={loading || !url} style={{
-            padding: '14px 28px', background: loading ? '#4338ca' : '#6366f1', color: 'white',
-            border: 'none', borderRadius: 10, cursor: loading ? 'not-allowed' : 'pointer', fontSize: 15, fontWeight: 600
-          }}>
-            {loading ? '⏳ Analyzing...' : '🚀 Analyze'}
-          </button>
+          {/* Search Bar */}
+          <div className="search-bar">
+            <input
+              id="repo-url-input"
+              className="search-input"
+              type="url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && analyze()}
+              placeholder="https://github.com/owner/repo"
+              aria-label="GitHub repository URL"
+              disabled={loading}
+            />
+            <button
+              id="analyze-btn"
+              className="btn-analyze"
+              onClick={analyze}
+              disabled={loading || !url.trim()}
+              aria-label="Analyze repository"
+            >
+              {loading ? '⏳ Analyzing…' : '🚀 Analyze'}
+            </button>
+          </div>
+
+          {/* Quick demo URLs */}
+          {!data && !loading && (
+            <div style={{ marginTop: 12, display: 'flex', gap: 6, justifyContent: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 12, color: '#475569', alignSelf: 'center' }}>Try:</span>
+              {DEMO_URLS.map((u) => (
+                <button
+                  key={u}
+                  onClick={() => setUrl(u)}
+                  style={{
+                    fontSize: 11, padding: '4px 10px', borderRadius: 999, cursor: 'pointer',
+                    background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.25)',
+                    color: '#818cf8', fontFamily: 'inherit', fontWeight: 600,
+                    transition: 'all 0.15s',
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(99,102,241,0.2)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(99,102,241,0.1)'; }}
+                >
+                  {u.replace('https://github.com/', '')}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Progress Bar */}
+          {loading && (
+            <div className="progress-wrap">
+              <div className="progress-track">
+                <div className="progress-fill" style={{ width: `${progress}%` }} />
+              </div>
+              <p className="progress-step">{step}</p>
+            </div>
+          )}
+
+          {/* Error Message */}
+          {error && !loading && (
+            <div
+              className="animate-fadeIn"
+              style={{
+                maxWidth: 680, margin: '14px auto 0',
+                padding: '14px 18px',
+                background: 'rgba(239,68,68,0.08)',
+                border: '1px solid rgba(239,68,68,0.3)',
+                borderRadius: 12, color: '#fca5a5', fontSize: 14,
+                display: 'flex', gap: 10, alignItems: 'flex-start',
+              }}
+            >
+              <span style={{ flexShrink: 0 }}>⚠️</span>
+              <div>
+                <strong>Analysis failed:</strong> {error}
+                {!import.meta.env.VITE_ANTHROPIC_API_KEY && (
+                  <p style={{ margin: '6px 0 0', fontSize: 12, color: '#94a3b8' }}>
+                    💡 Make sure you've created a <code style={{ background: 'rgba(0,0,0,0.3)', padding: '1px 4px', borderRadius: 3 }}>.env</code> file with your <code style={{ background: 'rgba(0,0,0,0.3)', padding: '1px 4px', borderRadius: 3 }}>VITE_ANTHROPIC_API_KEY</code>.
+                    Copy <strong>.env.example</strong> to <strong>.env</strong> to get started.
+                  </p>
+                )}
+              </div>
+              <button onClick={() => setError('')} style={{ marginLeft: 'auto', background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: 16, flexShrink: 0, padding: 0 }}>×</button>
+            </div>
+          )}
         </div>
+      </header>
 
-        {loading && (
-          <div style={{ maxWidth: 700, margin: '16px auto 0' }}>
-            <div style={{ background: '#1e1b4b', borderRadius: 8, height: 8, overflow: 'hidden' }}>
-              <div style={{ height: '100%', width: `${progress}%`, background: 'linear-gradient(to right, #6366f1, #a855f7)', transition: 'width 0.5s ease', borderRadius: 8 }} />
-            </div>
-            <p style={{ color: '#a5b4fc', margin: '8px 0 0', fontSize: 14 }}>{step}</p>
-          </div>
-        )}
-      </div>
-
+      {/* ── Main Content ── */}
       {data && (
-        <div style={{ maxWidth: 1000, margin: '0 auto', padding: '24px 16px' }}>
-          <div style={{ background: '#1e1b4b', border: '1px solid #312e81', borderRadius: 12, padding: 20, marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+        <main className="main-content">
+
+          {/* Repo Info Bar */}
+          <div className="repo-bar">
             <div>
-              <h2 style={{ margin: 0, color: '#a5b4fc' }}>📦 {data.repoInfo.name}</h2>
-              <p style={{ margin: '4px 0 0', color: '#64748b' }}>{data.repoInfo.description || 'No description'}</p>
+              <div className="repo-name">📦 {data.repoInfo?.name}</div>
+              <div className="repo-desc">{data.repoInfo?.description || 'No description'}</div>
             </div>
-            <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
-              <span style={{ background: '#312e81', padding: '6px 14px', borderRadius: 20, color: '#818cf8', fontWeight: 700, fontSize: 18 }}>
-                v{data.analysis?.version?.recommended}
-              </span>
-              <span>⭐ {data.repoInfo.stargazers_count}</span>
-              <span>🍴 {data.repoInfo.forks_count}</span>
-              <button onClick={downloadReport} style={{ padding: '8px 16px', background: '#10b981', color: 'white', border: 'none', borderRadius: 8, cursor: 'pointer', fontWeight: 600 }}>
-                ⬇️ Download
-              </button>
+            <div className="repo-meta">
+              <span className="version-badge">v{data.analysis?.version?.recommended || '?'}</span>
+              <span className="repo-stat">⭐ {data.repoInfo?.stargazers_count?.toLocaleString()}</span>
+              <span className="repo-stat">🍴 {data.repoInfo?.forks_count?.toLocaleString()}</span>
+              {data.repoInfo?.language && (
+                <span className="repo-stat">🔤 {data.repoInfo.language}</span>
+              )}
+              <a
+                href={data.repoInfo?.html_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  padding: '6px 14px', borderRadius: 8, fontSize: 13, fontWeight: 600,
+                  background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.3)',
+                  color: '#818cf8', textDecoration: 'none', transition: 'all 0.15s',
+                }}
+              >
+                GitHub ↗
+              </a>
             </div>
           </div>
 
-          <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
-            {TABS.map(tab => (
-              <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{
-                padding: '8px 16px', borderRadius: 8, cursor: 'pointer', fontSize: 13, fontWeight: 600,
-                background: activeTab === tab.id ? '#6366f1' : '#1e1b4b',
-                color: activeTab === tab.id ? 'white' : '#94a3b8',
-                border: activeTab === tab.id ? 'none' : '1px solid #312e81'
-              }}>
+          {/* Navigation Tabs */}
+          <nav className="nav-tabs" role="tablist" aria-label="Analysis sections">
+            {TABS.map((tab) => (
+              <button
+                key={tab.id}
+                id={`tab-${tab.id}`}
+                className={`nav-tab${activeTab === tab.id ? ' active' : ''}`}
+                role="tab"
+                aria-selected={activeTab === tab.id}
+                aria-controls={`panel-${tab.id}`}
+                onClick={() => setActiveTab(tab.id)}
+              >
                 {tab.label}
               </button>
             ))}
-          </div>
+          </nav>
 
-          {renderTab()}
+          {/* Tab Panel */}
+          <div
+            id={`panel-${activeTab}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${activeTab}`}
+            className="tab-content"
+            key={activeTab}
+          >
+            <ErrorBoundary title={`${activeTab} panel failed to render`}>
+              {renderTab()}
+            </ErrorBoundary>
+          </div>
+        </main>
+      )}
+
+      {/* ── Demo Tour Tooltip ── */}
+      {isDemoRunning && showTooltip && currentStepData && (
+        <div
+          className="animate-fadeInUp"
+          style={{
+            position: 'fixed', top: 20, left: '50%', transform: 'translateX(-50%)',
+            background: 'rgba(13,13,31,0.95)', backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(99,102,241,0.5)', borderRadius: 16,
+            padding: '16px 20px', maxWidth: 520, width: '90vw',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.6), 0 0 40px rgba(99,102,241,0.2)',
+            zIndex: 500,
+          }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#818cf8' }}>
+                {currentStepData.title}
+              </span>
+              <span style={{ fontSize: 11, color: '#475569', fontFamily: 'var(--font-mono)' }}>
+                {demoStep + 1}/{totalSteps}
+              </span>
+            </div>
+            <button
+              onClick={stopDemo}
+              style={{
+                background: 'none', border: 'none', color: '#475569',
+                cursor: 'pointer', fontSize: 16, padding: 0,
+              }}
+            >×</button>
+          </div>
+          <p style={{ margin: 0, color: '#94a3b8', fontSize: 13, lineHeight: 1.7 }}>
+            {currentStepData.narration}
+          </p>
+          {/* Progress dots */}
+          <div style={{ display: 'flex', gap: 4, marginTop: 12, justifyContent: 'center' }}>
+            {Array.from({ length: totalSteps }).map((_, i) => (
+              <div key={i} style={{
+                width: i === demoStep ? 16 : 6, height: 6, borderRadius: 999,
+                background: i === demoStep ? '#6366f1' : 'rgba(99,102,241,0.2)',
+                transition: 'all 0.3s ease',
+              }} />
+            ))}
+          </div>
         </div>
       )}
 
+      {/* ── Accessibility Toolbar ── */}
       <AccessibilityToolbar
-        onReadAloud={readAloud} speaking={speaking} onStop={stop}
-        fontScale={fontScale} setFontScale={setFontScale}
-        highContrast={highContrast} setHighContrast={setHighContrast}
+        onReadAloud={readAloud}
+        speaking={speaking}
+        onStop={stop}
+        fontScale={fontScale}
+        setFontScale={setFontScale}
+        highContrast={highContrast}
+        setHighContrast={setHighContrast}
+        startListening={startListening}
+        listening={listening}
+        onStartDemo={data ? startDemo : null}
+        isDemoRunning={isDemoRunning}
+        onStopDemo={stopDemo}
       />
     </div>
   );
